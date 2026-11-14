@@ -1,0 +1,67 @@
+name: Build Windows (custom)
+
+# Builds the Windows package (mkw.exe + the setup tools, nothing of the game) and, next to it, the source code that
+# produced it. Manual: Actions > "Build Windows (custom)" > Run workflow. Both come out as run artifacts.
+#
+# gen_opt is the optimization level of the generated game code (tools/build/build.py, MKW_GEN_OPT). It is set in the
+# repo's build.py BEFORE the package is assembled, so the runtime built here and the setup that ships inside the zip
+# use the same value: the runtime refuses a game library built with another one.
+on:
+  workflow_dispatch:
+    inputs:
+      gen_opt:
+        description: "Optimization of the generated game code"
+        type: choice
+        options: ["2", "1", "3", "s"]
+        default: "2"
+
+permissions:
+  contents: read
+
+env:
+  GEN_OPT: ${{ inputs.gen_opt || '2' }}
+
+jobs:
+  windows:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed git ninja binutils uv python zip
+      - uses: actions/checkout@v5
+      - name: Git trusts the checkout (build.py's version comes from git describe)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # The source as committed, before the optimization level is written into build.py.
+      - name: Source code
+        run: |
+          mkdir -p out
+          git archive --format=zip --prefix=mkw-recomp-src/ -o out/mkw-recomp-src.zip HEAD
+
+      - name: Optimization level (-O${{ env.GEN_OPT }})
+        run: |
+          grep -q 'os.environ.get("MKW_GEN_OPT", "1")' tools/build/build.py \
+            || { echo "tools/build/build.py has no MKW_GEN_OPT: apply mkw-gen-opt.patch first"; exit 1; }
+          sed -i "s/os.environ.get(\"MKW_GEN_OPT\", \"1\")/os.environ.get(\"MKW_GEN_OPT\", \"$GEN_OPT\")/" tools/build/build.py
+          grep -n 'MKW_GEN_OPT' tools/build/build.py
+
+      - uses: actions/cache@v4
+        with:
+          path: build/win
+          key: windeps-${{ hashFiles('tools/build/windeps.py') }}
+      - name: llvm-mingw and the Windows libraries
+        run: uv run tools/build/windeps.py
+      - name: mkw.exe
+        run: uv run tools/build/build.py --target windows --dist --runtime-only
+      - name: Setup tools
+        run: uv run tools/build/dist.py --target windows
+      - name: Zip
+        run: uv run tools/build/release.py --target windows --version "custom-O${GEN_OPT}-${GITHUB_RUN_NUMBER}"
+
+      - name: Gather
+        run: cp build/release/*.zip out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mkw-recomp-windows-O${{ env.GEN_OPT }}
+          path: out/*
+          retention-days: 14
